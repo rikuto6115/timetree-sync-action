@@ -1,11 +1,6 @@
 name: TimeTree Sync
-# Verified rollout: apply safe changes, then verify with a read-only rescan.
 
 on:
-  # Temporary main-only rollout trigger; remove after verified live run.
-  push:
-    branches: [main]
-    paths: [".github/workflows/sync.yml"]
   workflow_dispatch:
     inputs:
       dry_run:
@@ -58,5 +53,4 @@ jobs:
             python src/main.py --dry-run
           else
             python src/main.py
-            python src/main.py --dry-run
           fi
