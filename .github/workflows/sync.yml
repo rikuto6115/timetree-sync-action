@@ -1,5 +1,5 @@
 name: TimeTree Sync
-# Read-only rollout: diagnose source record shapes without private event data.
+# Read-only rollout: preserve blank/invalid records and preview valid changes.
 
 on:
   # Temporary rollout trigger; automatic runs are read-only until verified.

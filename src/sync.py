@@ -31,52 +31,38 @@ def sync(*, dry_run: bool = False):
         raise TypeError("Invalid TimeTree event list; no changes made")
     # Validate the entire snapshot BEFORE any Google writes. Never treat a
     # missing source event as a deletion, including an empty/partial response.
-    try:
-        events = [Event.from_timetree(raw) for raw in raw_events]
-    except (ValueError, TypeError, KeyError, OverflowError):
-        # Diagnose schema/placeholder records without logging private event data.
-        reasons = Counter()
-        shapes = Counter()
-        for raw in raw_events:
-            try:
-                Event.from_timetree(raw)
-            except (ValueError, TypeError, KeyError, OverflowError) as exc:
-                reason = (
-                    str(exc)
-                    if type(exc) in (ValueError, TypeError)
-                    else type(exc).__name__
-                )
-                allowed = (
-                    "Missing TimeTree title; refusing to clear an event",
-                    "Incomplete TimeTree event; no changes made",
-                    "Invalid TimeTree event duration",
-                    "Invalid TimeTree event ID",
-                    "Invalid TimeTree all_day value",
-                    "Invalid optional TimeTree event field",
-                    "Invalid TimeTree event timestamp",
-                    "Invalid TimeTree event",
-                )
-                reasons[reason if reason in allowed else type(exc).__name__] += 1
-                if isinstance(raw, dict):
-                    for key in ("deleted_at", "deactivated_at", "deleted", "cancelled"):
-                        if raw.get(key):
-                            shapes[key] += 1
-                    if raw.get("category") == 2:
-                        shapes["memo_category"] += 1
-                    if raw.get("title") is None:
-                        shapes["null_title"] += 1
-                    elif isinstance(raw.get("title"), str) and not raw["title"].strip():
-                        shapes["blank_title"] += 1
-        logger.error(
-            "Source validation blocked: total=%d reasons=%s shapes=%s",
-            len(raw_events),
-            dict(reasons),
-            dict(shapes),
-        )
-        raise
-
-    if len({event.id for event in events}) != len(events):
+    events = []
+    source_ids = []
+    withheld = Counter()
+    for raw in raw_events:
+        try:
+            event = Event.from_timetree(raw)
+        except ValueError as exc:
+            # Historical blank/invalid-duration records must not block safe
+            # records or clear Google data. Preserve the ENTIRE affected record.
+            if str(
+                exc
+            ) == "Missing TimeTree title; refusing to clear an event" and isinstance(
+                raw["title"], str
+            ):
+                withheld["blank_title"] += 1
+            elif str(exc) == "Invalid TimeTree event duration":
+                withheld["invalid_duration"] += 1
+            else:
+                raise
+            source_ids.append(str(raw["id"]))
+            continue
+        source_ids.append(event.id)
+        events.append(event)
+    if len(set(source_ids)) != len(source_ids):
         raise ValueError("Duplicate TimeTree IDs; no changes made")
+    logger.info(
+        "Source snapshot: total=%d validated=%d withheld=%d reasons=%s",
+        len(raw_events),
+        len(events),
+        sum(withheld.values()),
+        dict(withheld),
+    )
     if not events:
         logger.warning("No source events returned; Google Calendar left unchanged")
         return
@@ -101,8 +87,16 @@ def sync(*, dry_run: bool = False):
             # overwrite them or create another copy until ownership is known.
             ambiguous_ids.add(str(timetree_id))
 
+    logger.info(
+        "Google snapshot: total=%d managed=%d ambiguous_ids=%d",
+        len(google_events),
+        sum(len(matches) for matches in google_event_map.values()),
+        len(ambiguous_ids),
+    )
     operations = []
-    created_count = updated_count = skipped_count = preserved_count = 0
+    update_field_sets = Counter()
+    created_count = updated_count = skipped_count = 0
+    preserved_count = sum(withheld.values())
     for event in events:
         matches = google_event_map.get(event.id, [])
         if event.id in ambiguous_ids or len(matches) > 1:
@@ -126,6 +120,7 @@ def sync(*, dry_run: bool = False):
                 ("update", google_event["id"], patch, google_event["etag"])
             )
             updated_count += 1
+            update_field_sets[",".join(sorted(patch))] += 1
 
     logger.info(
         "Sync plan: create=%d update=%d skip=%d preserve=%d delete=0",
@@ -134,9 +129,10 @@ def sync(*, dry_run: bool = False):
         skipped_count,
         preserved_count,
     )
+    logger.info("Update field groups: %s", dict(update_field_sets))
     if preserved_count:
         logger.warning(
-            "Ambiguous, duplicate, cancelled, or unversioned matches were left unchanged"
+            "Withheld source records and ambiguous/duplicate/cancelled/unversioned matches were left unchanged"
         )
     if dry_run:
         logger.info("Dry run complete; no Google Calendar changes made")

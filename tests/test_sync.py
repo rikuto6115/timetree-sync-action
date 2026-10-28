@@ -271,6 +271,35 @@ class SyncTests(unittest.TestCase):
                 self.google_type.assert_not_called()
                 self.assert_no_writes()
 
+    def test_blank_titles_and_invalid_duration_preserve_whole_records(self):
+        blank = raw_event("blank", title="   ", note="private note")
+        invalid = raw_event("invalid", end_at=0)
+        self.source.get_events.return_value = [raw_event(), blank, invalid]
+        self.google.list_events.return_value = [
+            google_event(),
+            google_event(raw_event("blank")),
+            google_event(raw_event("invalid")),
+        ]
+        with self.assertLogs(sync_module.logger, level="INFO") as logs:
+            sync_module.sync()
+        self.assert_no_writes()
+        self.assertTrue(any("validated=1 withheld=2" in line for line in logs.output))
+        self.assertNotIn("private note", "\n".join(logs.output))
+
+    def test_withheld_record_cannot_hide_duplicate_source_id(self):
+        self.source.get_events.return_value = [raw_event(), raw_event(title="")]
+        with self.assertRaisesRegex(ValueError, "Duplicate TimeTree IDs"):
+            sync_module.sync()
+        self.google_type.assert_not_called()
+        self.assert_no_writes()
+
+    def test_nonstring_title_is_still_hard_failure(self):
+        self.source.get_events.return_value = [raw_event(title=None)]
+        with self.assertRaises(ValueError):
+            sync_module.sync()
+        self.google_type.assert_not_called()
+        self.assert_no_writes()
+
     def test_failed_source_fetch_does_not_touch_google(self):
         self.source.get_events.side_effect = RuntimeError("Failed page")
         with self.assertRaises(RuntimeError):
