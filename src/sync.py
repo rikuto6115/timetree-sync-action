@@ -1,3 +1,5 @@
+from collections import Counter
+
 from config import Config
 from gcalendar import GoogleCalendarClient
 from logger import logger
@@ -29,7 +31,50 @@ def sync(*, dry_run: bool = False):
         raise TypeError("Invalid TimeTree event list; no changes made")
     # Validate the entire snapshot BEFORE any Google writes. Never treat a
     # missing source event as a deletion, including an empty/partial response.
-    events = [Event.from_timetree(raw) for raw in raw_events]
+    try:
+        events = [Event.from_timetree(raw) for raw in raw_events]
+    except (ValueError, TypeError, KeyError, OverflowError):
+        # Diagnose schema/placeholder records without logging private event data.
+        reasons = Counter()
+        shapes = Counter()
+        for raw in raw_events:
+            try:
+                Event.from_timetree(raw)
+            except (ValueError, TypeError, KeyError, OverflowError) as exc:
+                reason = (
+                    str(exc)
+                    if type(exc) in (ValueError, TypeError)
+                    else type(exc).__name__
+                )
+                allowed = (
+                    "Missing TimeTree title; refusing to clear an event",
+                    "Incomplete TimeTree event; no changes made",
+                    "Invalid TimeTree event duration",
+                    "Invalid TimeTree event ID",
+                    "Invalid TimeTree all_day value",
+                    "Invalid optional TimeTree event field",
+                    "Invalid TimeTree event timestamp",
+                    "Invalid TimeTree event",
+                )
+                reasons[reason if reason in allowed else type(exc).__name__] += 1
+                if isinstance(raw, dict):
+                    for key in ("deleted_at", "deactivated_at", "deleted", "cancelled"):
+                        if raw.get(key):
+                            shapes[key] += 1
+                    if raw.get("category") == 2:
+                        shapes["memo_category"] += 1
+                    if raw.get("title") is None:
+                        shapes["null_title"] += 1
+                    elif isinstance(raw.get("title"), str) and not raw["title"].strip():
+                        shapes["blank_title"] += 1
+        logger.error(
+            "Source validation blocked: total=%d reasons=%s shapes=%s",
+            len(raw_events),
+            dict(reasons),
+            dict(shapes),
+        )
+        raise
+
     if len({event.id for event in events}) != len(events):
         raise ValueError("Duplicate TimeTree IDs; no changes made")
     if not events:

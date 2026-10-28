@@ -1,4 +1,5 @@
 name: TimeTree Sync
+# Read-only rollout: diagnose source record shapes without private event data.
 
 on:
   # Temporary rollout trigger; automatic runs are read-only until verified.
