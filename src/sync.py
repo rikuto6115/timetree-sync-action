@@ -1,4 +1,5 @@
 from collections import Counter
+from datetime import UTC, date, datetime, timedelta
 
 from config import Config
 from gcalendar import GoogleCalendarClient
@@ -95,6 +96,7 @@ def sync(*, dry_run: bool = False):
     )
     operations = []
     update_field_sets = Counter()
+    update_audit = Counter()
     created_count = updated_count = skipped_count = 0
     preserved_count = sum(withheld.values())
     for event in events:
@@ -121,6 +123,36 @@ def sync(*, dry_run: bool = False):
             )
             updated_count += 1
             update_field_sets[",".join(sorted(patch))] += 1
+            update_audit["all_day" if event.all_day else "timed"] += 1
+            for field in ("summary", "location", "description"):
+                if field in patch and not patch[field]:
+                    update_audit["explicit_clear_" + field] += 1
+            if event.all_day:
+                stratum = (
+                    "past"
+                    if event.end.date() < datetime.now(UTC).date()
+                    else "current_or_future"
+                )
+                end_clock = (
+                    "midnight"
+                    if (event.end.hour, event.end.minute, event.end.second) == (0, 0, 0)
+                    else "last_minute"
+                    if (event.end.hour, event.end.minute) == (23, 59)
+                    else "other_clock"
+                )
+                update_audit[stratum + "_source_end_" + end_clock] += 1
+                if event.start.date() == event.end.date():
+                    update_audit[stratum + "_single_inclusive_day"] += 1
+                else:
+                    update_audit[stratum + "_multiple_inclusive_days"] += 1
+            if event.all_day and set(patch) == {"end"}:
+                old_end = (google_event.get("end") or {}).get("date")
+                if old_end and date.fromisoformat(
+                    patch["end"]["date"]
+                ) - date.fromisoformat(old_end) == timedelta(days=1):
+                    update_audit["all_day_end_only_plus_one_day"] += 1
+                    if event.end.date() < datetime.now(UTC).date() - timedelta(days=1):
+                        update_audit["all_day_end_only_plus_one_day_historical"] += 1
 
     logger.info(
         "Sync plan: create=%d update=%d skip=%d preserve=%d delete=0",
@@ -130,6 +162,7 @@ def sync(*, dry_run: bool = False):
         preserved_count,
     )
     logger.info("Update field groups: %s", dict(update_field_sets))
+    logger.info("Update date audit: %s", dict(update_audit))
     if preserved_count:
         logger.warning(
             "Withheld source records and ambiguous/duplicate/cancelled/unversioned matches were left unchanged"

@@ -328,6 +328,19 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(any("create=1 update=1" in line for line in logs.output))
         self.assert_no_writes()
 
+    def test_dry_run_audits_all_day_end_correction_without_writing(self):
+        raw = raw_event(all_day=True)
+        self.source.get_events.return_value = [raw]
+        existing = google_event(raw)
+        existing["end"]["date"] = existing["start"]["date"]
+        self.google.list_events.return_value = [existing]
+        with self.assertLogs(sync_module.logger, level="INFO") as logs:
+            sync_module.sync(dry_run=True)
+        self.assertTrue(
+            any("all_day_end_only_plus_one_day" in line for line in logs.output)
+        )
+        self.assert_no_writes()
+
     def test_without_etag_or_cancelled_preserved(self):
         for overrides in ({"etag": None}, {"status": "cancelled"}):
             with self.subTest(overrides=overrides):
