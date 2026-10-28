@@ -1,8 +1,8 @@
 name: TimeTree Sync
-# Read-only rollout: audit all-day end-date corrections before live changes.
+# Verified rollout: apply safe changes, then verify with a read-only rescan.
 
 on:
-  # Temporary rollout trigger; automatic runs are read-only until verified.
+  # Temporary main-only rollout trigger; remove after verified live run.
   push:
     branches: [main]
     paths: [".github/workflows/sync.yml"]
@@ -47,7 +47,7 @@ jobs:
 
       - name: Run
         env:
-          DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
           TIMETREE_EMAIL: ${{ secrets.TIMETREE_EMAIL }}
           TIMETREE_PASSWORD: ${{ secrets.TIMETREE_PASSWORD }}
           TIMETREE_CALENDAR_CODE: ${{ secrets.TIMETREE_CALENDAR_CODE }}
@@ -58,4 +58,5 @@ jobs:
             python src/main.py --dry-run
           else
             python src/main.py
+            python src/main.py --dry-run
           fi
