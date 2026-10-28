@@ -1,17 +1,30 @@
 name: TimeTree Sync
 
 on:
+  # Temporary rollout trigger; automatic runs are read-only until verified.
+  push:
+    branches: [main]
+    paths: [".github/workflows/sync.yml"]
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview counts without changing Google Calendar"
+        type: boolean
+        default: true
 
-  # Public配布用では定期実行を無効化しています。
-  # 利用する場合は、下記3行の「#」を削除してください。
-  #
-   schedule:
-     - cron: "15 */6 * * *"
+  schedule:
+    # Every six hours (UTC); JST 03:15, 09:15, 15:15, 21:15.
+    - cron: "15 */6 * * *"
+
+# Share one lock across manual/scheduled runs and branches to avoid duplicates.
+concurrency:
+  group: timetree-google-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -28,12 +41,20 @@ jobs:
           pip install -r requirements.txt
           pip install ./vendor/timetree_exporter
 
+      - name: Safety tests (no network or credentials)
+        run: python -m unittest discover -s tests -v
+
       - name: Run
         env:
+          DRY_RUN: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run }}
           TIMETREE_EMAIL: ${{ secrets.TIMETREE_EMAIL }}
           TIMETREE_PASSWORD: ${{ secrets.TIMETREE_PASSWORD }}
           TIMETREE_CALENDAR_CODE: ${{ secrets.TIMETREE_CALENDAR_CODE }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
         run: |
-          python src/main.py
+          if [ "$DRY_RUN" = "true" ]; then
+            python src/main.py --dry-run
+          else
+            python src/main.py
+          fi

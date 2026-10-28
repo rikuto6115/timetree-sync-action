@@ -11,10 +11,10 @@ GitHub Actions を利用して定期的に実行し、TimeTree の予定を Goog
 * Google Calendar へ予定を自動同期
 * 新しい予定を自動作成
 * 変更された予定を自動更新
-* TimeTree で削除された予定を Google Calendar から自動削除
+* 削除は一切行わない（TimeTree 側で削除された予定・既存の重複も保持）
 * TimeTree のイベントIDを利用した差分同期
 * 同じ予定の重複登録を防止
-* Google Calendar で直接作成した予定は削除しない
+* Google Calendar で直接作成した予定や、別カレンダーの同期予定には触れない
 * GitHub Actions による定期自動実行
 
 ---
@@ -28,9 +28,18 @@ TimeTree のイベントIDを利用して、Google Calendar の予定と照合�
 | 新しい予定             | 作成                   |
 | 内容が変更された予定        | 更新                   |
 | 変更のない予定           | スキップ                 |
-| TimeTree で削除された予定 | 削除                   |
+| TimeTree で削除された予定 | 変更せず保持              |
 
-このプログラムが管理するのは、TimeTree から同期された予定だけです。
+このプログラムが更新するのは、`sync_source=timetree-sync-action` と
+現在の `timetree_calendar_code`、`timetree_id` が揃った予定だけです。
+所有元が不明な旧形式の予定、同じIDの重複は、上書き・自動移行・削除をせず保持します。
+その場合は新しい重複も作らず、ログの `preserve` 件数に含めます。
+
+更新は変更されたタイトル・日時・場所・メモだけを PATCH します。
+Google 側の通知、参加者、色、公開設定、添付や独自メタデータは保持します。
+ただし、TimeTree と同期する項目を Google 側だけで変更した場合は、次の同期で
+TimeTree の内容が優先されます。取得結果に場所・メモのキーが欠けていれば保持し、
+明示的な空欄は反映します。更新直前に別の編集が入った場合は ETag により停止します。
 
 Google Calendar で直接作成した予定には TimeTree のイベントIDが付与されないため、同期処理によって削除されることはありません。
 
@@ -257,7 +266,7 @@ Google Calendar で、次の順番に進みます。
 timetree-sync-action@your-project.iam.gserviceaccount.com
 ```
 
-予定を作成・更新・削除できる権限を付与してください。
+このプログラムは予定の追加・更新だけを行い、削除は行いません。
 
 少なくとも、予定を変更できる権限が必要です。
 
@@ -458,7 +467,12 @@ Sync TimeTree to Google Calendar
 Run workflow
 ```
 
-初回実行では、Google Calendar への予定登録に時間がかかる場合があります。
+手動実行は `dry_run=true` が初期値です。まずこのまま実行してログの
+`Sync plan: create=... update=... skip=... preserve=... delete=0` を確認してください。
+このプレビューでは Google Calendar を変更しません。反映するときだけ
+`dry_run` のチェックを外して再実行します。定期実行は追加・更新を反映します。
+
+本番反映前に安全性テストが自動実行されます。初回の追加には時間がかかる場合があります。
 
 実行が成功すると、GitHub Actions に緑色のチェックマークが表示されます。
 
@@ -466,19 +480,22 @@ Run workflow
 
 # 自動実行
 
-GitHub Actions のワークフローが次のように設定されている場合、このプログラムは3時間ごとに自動実行されます。
+GitHub Actions のワークフローが次のように設定されている場合、このプログラムは6時間ごとに自動実行されます。
 
 ```yaml
 on:
   workflow_dispatch:
 
   schedule:
-    - cron: "17 */3 * * *"
+    - cron: "15 */6 * * *"
 ```
 
 `workflow_dispatch` により、GitHub Actions の画面から手動実行することもできます。
 
-`cron` の時刻は UTC 基準です。
+`cron` の時刻は UTC 基準です（日本時間 03:15 / 09:15 / 15:15 / 21:15）。
+GitHub 側の混雑で遅延する場合があります。デフォルトブランチ上の設定が有効です。
+手動・定期実行は同じ concurrency ロックを使い、重複実行を避けます。
+既存の認証情報・Google カレンダーの共有権限は変更しません。
 
 ---
 
@@ -531,31 +548,42 @@ python src/main.py
 
 ---
 
-# 実行ログ
+# 検証と実行ログ
 
-同期時には、予定ごとに次のようなログが表示されます。
+認証情報なし・外部アクセスなしで実行するテスト:
 
-```text
-CREATE : 新しい予定
-UPDATE : 変更された予定
-SKIP   : 変更のない予定
-DELETE : TimeTreeから削除された予定
+```bash
+python -m unittest discover -s tests -v
+ruff check src tests
 ```
 
-意味は次のとおりです。
+既存の環境変数を使い、読み取りだけで件数を確認:
 
-| ログ       | 意味                                       |
-| -------- | ---------------------------------------- |
-| `CREATE` | Google Calendar に新しい予定を作成                |
-| `UPDATE` | Google Calendar の既存予定を更新                 |
-| `SKIP`   | 変更がないため処理を省略                             |
-| `DELETE` | TimeTree から削除された予定を Google Calendar から削除 |
+```bash
+python src/main.py --dry-run
+```
+
+同期前に計画件数、完了時に実行件数を出します（予定の内容や認証情報は出しません）。
+
+```text
+Sync plan: create=2 update=1 skip=10 preserve=0 delete=0
+Sync complete: created=2 updated=1 deleted=0
+```
+
+`preserve` は所有元不明・重複・キャンセル済み・ETag不明の既存予定などを保持した件数です。
+取得失敗・不正なページ・不完全な予定・重複した元IDは、書き込み前に停止します。
+空の取得結果なら何も変更しません。取得結果にない Google の予定もそのまま保持します。
+実行途中で通信エラーが発生すると、その時点で停止します。既に完了した追加・更新は
+巻き戻さず、次回の読み取り・差分照合で続行します。
+
+終日予定は同梱の TimeTree exporter の仕様に合わせ、最終日を含む元データから
+Google の「終了日を含まない」形式へ変換します。時刻付き予定は元のタイムゾーンを使用します。
 
 ---
 
 # Google Calendar の既存予定について
 
-このプログラムは、TimeTree のイベントIDを持つ予定を同期対象として管理します。
+このプログラムは、TimeTree のイベントIDと所有元マーカーが一致する予定だけを更新します。
 
 Google Calendar で直接作成した通常の予定は、TimeTree のイベントIDを持たないため、同期処理によって削除されません。
 

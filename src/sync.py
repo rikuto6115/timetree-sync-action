@@ -6,133 +6,101 @@ from timetree import TimeTree
 
 
 def _private_properties(google_event: dict) -> dict:
-    return google_event.get("extendedProperties", {}).get("private", {})
+    return (google_event.get("extendedProperties") or {}).get("private") or {}
 
 
 def _is_managed_google_event(google_event: dict, calendar_code: str) -> bool:
-    """Return True only for events owned by this TimeTree sync.
-
-    Events created by older versions are also accepted when they contain a
-    timetree_id but do not yet have the newer ownership markers.
-    """
+    """Require explicit ownership; a legacy ID alone cannot prove the source."""
     props = _private_properties(google_event)
-    timetree_id = props.get("timetree_id")
-
-    if not timetree_id:
-        return False
-
-    sync_source = props.get("sync_source")
-    source_calendar_code = props.get("timetree_calendar_code")
-
-    # Backward compatibility for events created by older versions.
-    if sync_source is None and source_calendar_code is None:
-        return True
-
-    return sync_source == Event.SYNC_SOURCE and source_calendar_code == calendar_code
+    return bool(props.get("timetree_id")) and (
+        props.get("sync_source") == Event.SYNC_SOURCE
+        and props.get("timetree_calendar_code") == calendar_code
+    )
 
 
-def sync():
+def sync(*, dry_run: bool = False):
     client = TimeTree()
-    client.login(
-        Config.TIMETREE_EMAIL,
-        Config.TIMETREE_PASSWORD,
-    )
-    calendar = client.get_calendar(
-        Config.TIMETREE_CALENDAR_CODE,
-    )
+    client.login(Config.TIMETREE_EMAIL, Config.TIMETREE_PASSWORD)
+    calendar = client.get_calendar(Config.TIMETREE_CALENDAR_CODE)
     logger.info("Selected TimeTree calendar")
 
     raw_events = client.get_events(calendar)
+    if not isinstance(raw_events, list):
+        raise TypeError("Invalid TimeTree event list; no changes made")
+    # Validate the entire snapshot BEFORE any Google writes. Never treat a
+    # missing source event as a deletion, including an empty/partial response.
     events = [Event.from_timetree(raw) for raw in raw_events]
-    timetree_ids = {event.id for event in events}
+    if len({event.id for event in events}) != len(events):
+        raise ValueError("Duplicate TimeTree IDs; no changes made")
+    if not events:
+        logger.warning("No source events returned; Google Calendar left unchanged")
+        return
 
-    google = GoogleCalendarClient(
-        Config.GOOGLE_SERVICE_ACCOUNT_JSON,
-    )
-    logger.info("Connected to Google Calendar")
+    google = GoogleCalendarClient(Config.GOOGLE_SERVICE_ACCOUNT_JSON)
+    google_events = google.list_events(Config.GOOGLE_CALENDAR_ID)
+    logger.info("Connected to Google Calendar; add/update only, deletion disabled")
 
-    google_events = google.list_events(
-        Config.GOOGLE_CALENDAR_ID,
-    )
-
-    # Keep all Google copies for each TimeTree ID. This lets us clean up
-    # duplicates left by older versions or interrupted sync runs.
     google_event_map: dict[str, list[dict]] = {}
-
+    ambiguous_ids = set()
     for google_event in google_events:
-        if not _is_managed_google_event(
-            google_event,
-            Config.TIMETREE_CALENDAR_CODE,
-        ):
-            # Native Google Calendar events and events managed by another
-            # calendar/workflow are intentionally ignored.
+        props = _private_properties(google_event)
+        timetree_id = props.get("timetree_id")
+        if not timetree_id:
             continue
+        if _is_managed_google_event(google_event, Config.TIMETREE_CALENDAR_CODE):
+            if not google_event.get("id"):
+                raise ValueError("Invalid managed Google event; no changes made")
+            google_event_map.setdefault(str(timetree_id), []).append(google_event)
+        elif not props.get("sync_source") or not props.get("timetree_calendar_code"):
+            # Unscoped legacy markers may belong to another calendar. Do not
+            # overwrite them or create another copy until ownership is known.
+            ambiguous_ids.add(str(timetree_id))
 
-        timetree_id = _private_properties(google_event)["timetree_id"]
-        google_event_map.setdefault(timetree_id, []).append(google_event)
-
-    created_count = 0
-    updated_count = 0
-    deleted_count = 0
-    skipped_count = 0
-
+    operations = []
+    created_count = updated_count = skipped_count = preserved_count = 0
     for event in events:
         matches = google_event_map.get(event.id, [])
+        if event.id in ambiguous_ids or len(matches) > 1:
+            # Preserve every duplicate; do not guess which copy a person edited.
+            preserved_count += 1
+            continue
         if not matches:
-            google.create_event(
-                Config.GOOGLE_CALENDAR_ID,
-                event.to_google(Config.TIMETREE_CALENDAR_CODE),
+            operations.append(
+                ("create", None, event.to_google(Config.TIMETREE_CALENDAR_CODE), None)
             )
             created_count += 1
             continue
-
-        # Keep one canonical Google event for this TimeTree event.
         google_event = matches[0]
-        props = _private_properties(google_event)
-        needs_marker_migration = (
-            props.get("sync_source") != Event.SYNC_SOURCE
-            or props.get("timetree_calendar_code") != Config.TIMETREE_CALENDAR_CODE
-        )
-
-        if needs_marker_migration or not event.equals_google(
-            google_event,
-            Config.TIMETREE_CALENDAR_CODE,
-        ):
-            google.update_event(
-                Config.GOOGLE_CALENDAR_ID,
-                google_event["id"],
-                event.to_google(Config.TIMETREE_CALENDAR_CODE),
+        patch = event.google_patch(google_event, Config.TIMETREE_CALENDAR_CODE)
+        if not patch:
+            skipped_count += 1
+        elif not google_event.get("etag") or google_event.get("status") == "cancelled":
+            preserved_count += 1
+        else:
+            operations.append(
+                ("update", google_event["id"], patch, google_event["etag"])
             )
             updated_count += 1
-        else:
-            skipped_count += 1
-
-        # Remove duplicate Google copies carrying the same TimeTree ID.
-        for duplicate in matches[1:]:
-            google.delete_event(
-                Config.GOOGLE_CALENDAR_ID,
-                duplicate["id"],
-            )
-            deleted_count += 1
-
-    # Delete Google events owned by this sync when the source TimeTree event
-    # no longer exists. Native Google Calendar events are never included in
-    # google_event_map, so they are left untouched.
-    for timetree_id, matches in google_event_map.items():
-        if timetree_id in timetree_ids:
-            continue
-
-        for google_event in matches:
-            google.delete_event(
-                Config.GOOGLE_CALENDAR_ID,
-                google_event["id"],
-            )
-            deleted_count += 1
 
     logger.info(
-        "Sync complete: created=%d updated=%d deleted=%d skipped=%d",
+        "Sync plan: create=%d update=%d skip=%d preserve=%d delete=0",
         created_count,
         updated_count,
-        deleted_count,
         skipped_count,
+        preserved_count,
+    )
+    if preserved_count:
+        logger.warning(
+            "Ambiguous, duplicate, cancelled, or unversioned matches were left unchanged"
+        )
+    if dry_run:
+        logger.info("Dry run complete; no Google Calendar changes made")
+        return
+    for action, event_id, body, etag in operations:
+        if action == "create":
+            google.create_event(Config.GOOGLE_CALENDAR_ID, body)
+        else:
+            google.update_event(Config.GOOGLE_CALENDAR_ID, event_id, body, etag=etag)
+    logger.info(
+        "Sync complete: created=%d updated=%d deleted=0", created_count, updated_count
     )

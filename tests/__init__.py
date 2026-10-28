@@ -1,2 +1,1 @@
-tests/
-    __init__.py
+"""Offline regression tests for the safe calendar sync."""

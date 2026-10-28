@@ -169,26 +169,44 @@ class TimeTreeCalendar:
 
         return labels
 
-    def get_events_recur(self, calendar_id: int, since: int):
+    @staticmethod
+    def _validate_event_page(payload):
+        """Fail closed on incomplete/error payloads before any synchronization."""
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("events"), list)
+            or not isinstance(payload.get("chunk"), bool)
+            or (payload["chunk"] and payload.get("since") is None)
+        ):
+            raise ValueError("Incomplete TimeTree event page")
+
+    def get_events_recur(self, calendar_id: int, since: int, _seen_since=None):
         """
         Get events from the calendar.(Recursively)
         """
+        seen_since = set() if _seen_since is None else set(_seen_since)
+        if since in seen_since:
+            raise ValueError("TimeTree pagination cursor did not advance")
+        seen_since.add(since)
         url = f"{API_BASEURI}/calendar/{calendar_id}/events/sync?since={since}"
         response = self.session.get(
             url,
+            timeout=30,
             headers={
                 "Content-Type": "application/json",
                 "X-Timetreea": API_USER_AGENT,
             },
         )
 
+        response.raise_for_status()
         r_json = response.json()
+        self._validate_event_page(r_json)
         self._record_raw_response(f"calendar_{calendar_id}/events_sync_since_{since}", r_json)
 
         events = r_json["events"]
         logger.info("Fetched %d events", len(events))
         if r_json["chunk"] is True:
-            events.extend(self.get_events_recur(calendar_id, r_json["since"]))
+            events.extend(self.get_events_recur(calendar_id, r_json["since"], seen_since))
         return events
 
     @staticmethod
@@ -319,16 +337,12 @@ class TimeTreeCalendar:
         url = f"{API_BASEURI}/calendar/{calendar_id}/events/sync"
         response = self.session.get(
             url,
+            timeout=30,
             headers={"Content-Type": "application/json", "X-Timetreea": API_USER_AGENT},
         )
-        if response.status_code != 200:
-            if calendar_name is not None:
-                logger.error("Failed to get events of the calendar '%s'", calendar_name)
-            else:
-                logger.error("Failed to get events of the calendar")
-            logger.error(response.text)
-
+        response.raise_for_status()
         r_json = response.json()
+        self._validate_event_page(r_json)
         self._record_raw_response(f"calendar_{calendar_id}/events_sync", r_json)
         events = r_json["events"]
         logger.info("Fetched %d events", len(events))

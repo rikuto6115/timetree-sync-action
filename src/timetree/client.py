@@ -32,24 +32,3 @@ class TimeTreeClient:
         )
         response.raise_for_status()
         return response
-
-    def update_event(self, calendar_id: str, event_id: str, event: dict):
-        return (
-            self._service.events()
-            .update(
-                calendarId=calendar_id,
-                eventId=event_id,
-                body=event,
-            )
-            .execute()
-        )
-
-    def delete_event(self, calendar_id: str, event_id: str):
-        return (
-            self._service.events()
-            .delete(
-                calendarId=calendar_id,
-                eventId=event_id,
-            )
-            .execute()
-        )

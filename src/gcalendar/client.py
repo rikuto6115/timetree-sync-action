@@ -38,6 +38,7 @@ class GoogleCalendarClient:
     def list_events(self, calendar_id: str):
         events = []
         page_token = None
+        seen_tokens = set()
         while True:
             response = (
                 self._service.events()
@@ -49,29 +50,26 @@ class GoogleCalendarClient:
                 )
                 .execute()
             )
+            if not isinstance(response, dict) or not isinstance(
+                response.get("items", []), list
+            ):
+                raise TypeError("Invalid Google Calendar event page")
             events.extend(response.get("items", []))
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
+            if not isinstance(page_token, str) or page_token in seen_tokens:
+                raise ValueError("Google Calendar pagination cursor did not advance")
+            seen_tokens.add(page_token)
         return events
 
-    def update_event(self, calendar_id: str, event_id: str, event: dict):
-        return (
-            self._service.events()
-            .update(
-                calendarId=calendar_id,
-                eventId=event_id,
-                body=event,
-            )
-            .execute()
+    def update_event(self, calendar_id: str, event_id: str, event: dict, *, etag: str):
+        # PATCH leaves reminders, guests, sharing flags, attachments, and private
+        # metadata unchanged. Reject concurrent edits rather than overwriting them.
+        request = self._service.events().patch(
+            calendarId=calendar_id,
+            eventId=event_id,
+            body=event,
         )
-
-    def delete_event(self, calendar_id: str, event_id: str):
-        return (
-            self._service.events()
-            .delete(
-                calendarId=calendar_id,
-                eventId=event_id,
-            )
-            .execute()
-        )
+        request.headers["If-Match"] = etag
+        return request.execute()
